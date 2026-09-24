@@ -135,7 +135,7 @@ def create_task():
             "error": "title and user_id are required"
         }), 400
 
-    # Programmatic REST call to User Service.
+    # REST call to User Service.
     try:
         response = requests.get(
             f"{USER_SERVICE_URL}/api/users/{user_id}",
