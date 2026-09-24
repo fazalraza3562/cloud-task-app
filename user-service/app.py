@@ -1,11 +1,39 @@
+import os
+
+import psycopg
 from flask import Flask, jsonify, request
+from psycopg.errors import UniqueViolation
+from psycopg.rows import dict_row
 
 app = Flask(__name__)
 
-# Temporary in-memory storage.
-# We will replace this with PostgreSQL later.
-users = []
-next_user_id = 1
+
+def get_db_connection():
+    return psycopg.connect(
+        host=os.getenv("DB_HOST", "localhost"),
+        port=os.getenv("DB_PORT", "5432"),
+        dbname=os.getenv("DB_NAME", "cloudtasks"),
+        user=os.getenv("DB_USER", "clouduser"),
+        password=os.getenv("DB_PASSWORD"),
+        row_factory=dict_row
+    )
+
+
+def init_db():
+    conn = get_db_connection()
+
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    id SERIAL PRIMARY KEY,
+                    name VARCHAR(100) NOT NULL,
+                    email VARCHAR(255) UNIQUE NOT NULL
+                );
+            """)
+        conn.commit()
+    finally:
+        conn.close()
 
 
 @app.route("/", methods=["GET"])
@@ -18,31 +46,69 @@ def home():
 
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({
-        "status": "healthy",
-        "service": "user-service"
-    }), 200
+    try:
+        conn = get_db_connection()
+
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1;")
+
+        conn.close()
+
+        return jsonify({
+            "status": "healthy",
+            "service": "user-service",
+            "database": "connected"
+        }), 200
+
+    except Exception:
+        return jsonify({
+            "status": "unhealthy",
+            "service": "user-service",
+            "database": "unavailable"
+        }), 503
 
 
 @app.route("/api/users", methods=["GET"])
 def get_users():
-    return jsonify(users), 200
+    conn = get_db_connection()
+
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT id, name, email
+                FROM users
+                ORDER BY id;
+            """)
+            users = cur.fetchall()
+
+        return jsonify(users), 200
+    finally:
+        conn.close()
 
 
 @app.route("/api/users/<int:user_id>", methods=["GET"])
 def get_user(user_id):
-    user = next((user for user in users if user["id"] == user_id), None)
+    conn = get_db_connection()
 
-    if user is None:
-        return jsonify({"error": "User not found"}), 404
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT id, name, email
+                FROM users
+                WHERE id = %s;
+            """, (user_id,))
+            user = cur.fetchone()
 
-    return jsonify(user), 200
+        if user is None:
+            return jsonify({"error": "User not found"}), 404
+
+        return jsonify(user), 200
+    finally:
+        conn.close()
 
 
 @app.route("/api/users", methods=["POST"])
 def create_user():
-    global next_user_id
-
     data = request.get_json()
 
     if not data:
@@ -56,54 +122,113 @@ def create_user():
             "error": "Both name and email are required"
         }), 400
 
-    user = {
-        "id": next_user_id,
-        "name": name,
-        "email": email
-    }
+    conn = get_db_connection()
 
-    users.append(user)
-    next_user_id += 1
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO users (name, email)
+                VALUES (%s, %s)
+                RETURNING id, name, email;
+            """, (name, email))
 
-    return jsonify(user), 201
+            user = cur.fetchone()
+
+        conn.commit()
+        return jsonify(user), 201
+
+    except UniqueViolation:
+        conn.rollback()
+
+        return jsonify({
+            "error": "A user with this email already exists"
+        }), 409
+
+    finally:
+        conn.close()
 
 
 @app.route("/api/users/<int:user_id>", methods=["PUT"])
 def update_user(user_id):
-    user = next((user for user in users if user["id"] == user_id), None)
-
-    if user is None:
-        return jsonify({"error": "User not found"}), 404
-
     data = request.get_json()
 
     if not data:
         return jsonify({"error": "JSON body is required"}), 400
 
-    if "name" in data:
-        user["name"] = data["name"]
+    conn = get_db_connection()
 
-    if "email" in data:
-        user["email"] = data["email"]
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT id, name, email
+                FROM users
+                WHERE id = %s;
+            """, (user_id,))
 
-    return jsonify(user), 200
+            existing_user = cur.fetchone()
+
+            if existing_user is None:
+                return jsonify({"error": "User not found"}), 404
+
+            new_name = data.get("name", existing_user["name"])
+            new_email = data.get("email", existing_user["email"])
+
+            cur.execute("""
+                UPDATE users
+                SET name = %s, email = %s
+                WHERE id = %s
+                RETURNING id, name, email;
+            """, (new_name, new_email, user_id))
+
+            updated_user = cur.fetchone()
+
+        conn.commit()
+        return jsonify(updated_user), 200
+
+    except UniqueViolation:
+        conn.rollback()
+
+        return jsonify({
+            "error": "A user with this email already exists"
+        }), 409
+
+    finally:
+        conn.close()
 
 
 @app.route("/api/users/<int:user_id>", methods=["DELETE"])
 def delete_user(user_id):
-    global users
+    conn = get_db_connection()
 
-    user = next((user for user in users if user["id"] == user_id), None)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                DELETE FROM users
+                WHERE id = %s
+                RETURNING id;
+            """, (user_id,))
 
-    if user is None:
-        return jsonify({"error": "User not found"}), 404
+            deleted_user = cur.fetchone()
 
-    users = [user for user in users if user["id"] != user_id]
+        if deleted_user is None:
+            conn.rollback()
+            return jsonify({"error": "User not found"}), 404
 
-    return jsonify({
-        "message": "User deleted successfully"
-    }), 200
+        conn.commit()
+
+        return jsonify({
+            "message": "User deleted successfully"
+        }), 200
+
+    finally:
+        conn.close()
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5001, debug=True)
+    init_db()
+
+    app.run(
+        host="0.0.0.0",
+        port=5001,
+        debug=True
+    )
