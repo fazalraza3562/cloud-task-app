@@ -1,6 +1,9 @@
 import os
+
+import psycopg
 import requests
 from flask import Flask, jsonify, request
+from psycopg.rows import dict_row
 
 app = Flask(__name__)
 
@@ -9,8 +12,35 @@ USER_SERVICE_URL = os.getenv(
     "http://localhost:5001"
 )
 
-tasks = []
-next_task_id = 1
+
+def get_db_connection():
+    return psycopg.connect(
+        host=os.getenv("DB_HOST", "localhost"),
+        port=os.getenv("DB_PORT", "5432"),
+        dbname=os.getenv("DB_NAME", "cloudtasks"),
+        user=os.getenv("DB_USER", "clouduser"),
+        password=os.getenv("DB_PASSWORD"),
+        row_factory=dict_row
+    )
+
+
+def init_db():
+    conn = get_db_connection()
+
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS tasks (
+                    id SERIAL PRIMARY KEY,
+                    title VARCHAR(255) NOT NULL,
+                    completed BOOLEAN NOT NULL DEFAULT FALSE,
+                    user_id INTEGER NOT NULL
+                );
+            """)
+
+        conn.commit()
+    finally:
+        conn.close()
 
 
 @app.route("/", methods=["GET"])
@@ -23,38 +53,79 @@ def home():
 
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({
-        "status": "healthy",
-        "service": "task-service"
-    }), 200
+    try:
+        conn = get_db_connection()
+
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1;")
+
+        conn.close()
+
+        return jsonify({
+            "status": "healthy",
+            "service": "task-service",
+            "database": "connected"
+        }), 200
+
+    except Exception:
+        return jsonify({
+            "status": "unhealthy",
+            "service": "task-service",
+            "database": "unavailable"
+        }), 503
 
 
 @app.route("/api/tasks", methods=["GET"])
 def get_tasks():
-    return jsonify(tasks), 200
+    conn = get_db_connection()
+
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT id, title, completed, user_id
+                FROM tasks
+                ORDER BY id;
+            """)
+
+            tasks = cur.fetchall()
+
+        return jsonify(tasks), 200
+    finally:
+        conn.close()
 
 
 @app.route("/api/tasks/<int:task_id>", methods=["GET"])
 def get_task(task_id):
-    task = next(
-        (task for task in tasks if task["id"] == task_id),
-        None
-    )
+    conn = get_db_connection()
 
-    if task is None:
-        return jsonify({"error": "Task not found"}), 404
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT id, title, completed, user_id
+                FROM tasks
+                WHERE id = %s;
+            """, (task_id,))
 
-    return jsonify(task), 200
+            task = cur.fetchone()
+
+        if task is None:
+            return jsonify({
+                "error": "Task not found"
+            }), 404
+
+        return jsonify(task), 200
+    finally:
+        conn.close()
 
 
 @app.route("/api/tasks", methods=["POST"])
 def create_task():
-    global next_task_id
-
     data = request.get_json()
 
     if not data:
-        return jsonify({"error": "JSON body is required"}), 400
+        return jsonify({
+            "error": "JSON body is required"
+        }), 400
 
     title = data.get("title")
     user_id = data.get("user_id")
@@ -64,6 +135,7 @@ def create_task():
             "error": "title and user_id are required"
         }), 400
 
+    # Programmatic REST call to User Service.
     try:
         response = requests.get(
             f"{USER_SERVICE_URL}/api/users/{user_id}",
@@ -86,67 +158,128 @@ def create_task():
 
     user = response.json()
 
-    task = {
-        "id": next_task_id,
-        "title": title,
-        "completed": False,
-        "user_id": user_id,
-        "assigned_user": user["name"]
-    }
+    conn = get_db_connection()
 
-    tasks.append(task)
-    next_task_id += 1
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO tasks (
+                    title,
+                    completed,
+                    user_id
+                )
+                VALUES (%s, %s, %s)
+                RETURNING id, title, completed, user_id;
+            """, (
+                title,
+                False,
+                user_id
+            ))
 
-    return jsonify(task), 201
+            task = cur.fetchone()
+
+        conn.commit()
+
+        task["assigned_user"] = user["name"]
+
+        return jsonify(task), 201
+
+    finally:
+        conn.close()
 
 
 @app.route("/api/tasks/<int:task_id>", methods=["PUT"])
 def update_task(task_id):
-    task = next(
-        (task for task in tasks if task["id"] == task_id),
-        None
-    )
-
-    if task is None:
-        return jsonify({"error": "Task not found"}), 404
-
     data = request.get_json()
 
     if not data:
-        return jsonify({"error": "JSON body is required"}), 400
+        return jsonify({
+            "error": "JSON body is required"
+        }), 400
 
-    if "title" in data:
-        task["title"] = data["title"]
+    conn = get_db_connection()
 
-    if "completed" in data:
-        task["completed"] = bool(data["completed"])
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT id, title, completed, user_id
+                FROM tasks
+                WHERE id = %s;
+            """, (task_id,))
 
-    return jsonify(task), 200
+            existing_task = cur.fetchone()
+
+            if existing_task is None:
+                return jsonify({
+                    "error": "Task not found"
+                }), 404
+
+            new_title = data.get(
+                "title",
+                existing_task["title"]
+            )
+
+            new_completed = data.get(
+                "completed",
+                existing_task["completed"]
+            )
+
+            cur.execute("""
+                UPDATE tasks
+                SET title = %s,
+                    completed = %s
+                WHERE id = %s
+                RETURNING id, title, completed, user_id;
+            """, (
+                new_title,
+                new_completed,
+                task_id
+            ))
+
+            updated_task = cur.fetchone()
+
+        conn.commit()
+
+        return jsonify(updated_task), 200
+
+    finally:
+        conn.close()
 
 
 @app.route("/api/tasks/<int:task_id>", methods=["DELETE"])
 def delete_task(task_id):
-    global tasks
+    conn = get_db_connection()
 
-    task = next(
-        (task for task in tasks if task["id"] == task_id),
-        None
-    )
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                DELETE FROM tasks
+                WHERE id = %s
+                RETURNING id;
+            """, (task_id,))
 
-    if task is None:
-        return jsonify({"error": "Task not found"}), 404
+            deleted_task = cur.fetchone()
 
-    tasks = [
-        task for task in tasks
-        if task["id"] != task_id
-    ]
+        if deleted_task is None:
+            conn.rollback()
 
-    return jsonify({
-        "message": "Task deleted successfully"
-    }), 200
+            return jsonify({
+                "error": "Task not found"
+            }), 404
+
+        conn.commit()
+
+        return jsonify({
+            "message": "Task deleted successfully"
+        }), 200
+
+    finally:
+        conn.close()
 
 
 if __name__ == "__main__":
+    init_db()
+
     app.run(
         host="0.0.0.0",
         port=5002,
